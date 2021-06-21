@@ -4,6 +4,10 @@ import os
 import sys
 import coco
 import argparse
+import pickle
+import pandas as pd
+from collections import defaultdict
+from functools import partial
 import tensorflow as tf
 ROOT_DIR = os.path.abspath("../")
 os.environ['KERAS_BACKEND'] = 'tensorflow'
@@ -67,6 +71,8 @@ def parse_args():
 
     parser.add_argument('--path', dest='path', help='provide the path of the image directory',
                         default=0, type=str)
+    parser.add_argument('--tsv', dest='tsv', help='tsv eye tracking data',
+                        default=0, type=str)
 
     args = parser.parse_args()
 
@@ -116,7 +122,7 @@ def display_instances(image, boxes, masks, ids, names, scores):
         label = names[ids[i]]
         color = class_dict[label]
         score = scores[i] if scores is not None else None
-        caption = '{} {:.2f}'.format(label, score) if score else label
+        caption = '{} {:.2f}'.format('monitor', score) if score else 'monitor' 
         mask = masks[:, :, i]
 
         image = apply_mask(image, mask, color)
@@ -133,23 +139,107 @@ if __name__ == '__main__':
     
     args = parse_args()
     Path = str(args.path)
+
+    tsv = str(args.tsv)
     
     capture = cv2.VideoCapture(Path)
+
+    cols = ['Recording timestamp [μs]', 'Gaze point X [MCS px]', 'Gaze point Y [MCS px]']
+
+    tsv_data = pd.read_csv(tsv, sep='\t')[cols]
+
+    tsv_data = tsv_data.dropna(axis=0, how='any', thresh=None, subset=None, inplace=False).reset_index(drop=True)
+
+    ts, gaze_x, gaze_y = cols
+
+    frame_width = int(capture.get(3))
+    frame_height = int(capture.get(4))
 
     capture.set(cv2.CAP_PROP_FRAME_WIDTH, 720)
 
     capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    while True:
-        ret, frame = capture.read()
-        results = model.detect([frame], verbose=0)
-        r = results[0]
-        frame = display_instances(
-            frame, r['rois'], r['masks'], r['class_ids'], class_names, r['scores']
-        )
-        cv2.imshow('frame', frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+    out = cv2.VideoWriter('output.mp4', cv2.VideoWriter_fourcc(*'mp4v'), 15.0, (frame_width, frame_height))
+    print("Video opened:", out.isOpened())
 
+    MIN_FRAME = 200
+    MAX_FRAME = 2000
+    SKIP_FRAME = 2
+    frame_idx = 0
+    while frame_idx < MAX_FRAME:
+        frame_idx += 1
+        ret, frame = capture.read()
+        if frame_idx < MIN_FRAME or frame_idx % SKIP_FRAME != 0:
+            print("skipping frame: ", frame_idx)
+            continue
+        print("Writing frame: ", frame_idx)
+
+        results = model.detect([frame], verbose=0)
+        all_detections = results[0]
+
+        tvs = defaultdict(list)
+
+        for i, class_id in enumerate(all_detections['class_ids']):
+            if class_id != 63:
+                continue
+            tvs['rois'].append(all_detections['rois'][i])
+            tvs['class_ids'].append(all_detections['class_ids'][i])
+            tvs['scores'].append(all_detections['scores'][i])
+            tvs['masks'].append(all_detections['masks'][:, :, i])
+
+        tvs['rois'] = np.array(tvs['rois'])
+        tvs['class_ids'] = np.array(tvs['class_ids'])
+        tvs['scores'] = np.array(tvs['scores'])
+
+        tmp = tvs['masks']
+
+        tvs['masks'] = np.zeros((frame_height, frame_width, len(tvs['class_ids'])))
+
+        for i in range(len(tvs['class_ids'])):
+            # hacky way of arranging numpy masks.. not ideal
+            tvs['masks'][:, :, i] = tmp[i]
+
+        frame = display_instances(
+            frame, tvs['rois'], tvs['masks'], tvs['class_ids'], class_names, tvs['scores']
+        )
+
+        ref_time = capture.get(cv2.CAP_PROP_POS_MSEC) * 1000
+
+        min_idx = ((tsv_data[ts] - ref_time) ** 2).argmin()
+
+        eyegaze = tsv_data.loc[[min_idx], [gaze_x, gaze_y]]
+        center = (int(eyegaze.values[0][0]), int(eyegaze.values[0][1]))
+
+        cv2.circle(frame, center, 5, (0, 255, 0), 2);
+
+        def is_inside(gaze, box):
+            y1, x1, y2, x2 = box
+            cond1 = x1 <= gaze[0] and gaze[0] <= x2
+            cond2 = y1 <= gaze[1] and gaze[1] <= y2
+            return  cond1 and cond2
+
+        if len(tvs['rois']) == 2:
+            box_left = tvs['rois'][1]
+            box_right = tvs['rois'][0]
+
+            if (is_inside(center, box_left)):
+                cv2.putText(frame, "Gazing left monitor", (10, frame_height-100),
+                    cv2.FONT_HERSHEY_SIMPLEX, 3, (0, 255, 0), 2)
+
+            if (is_inside(center, box_right)):
+                cv2.putText(frame, "Gazing right monitor", (10, frame_height - 100),
+                    cv2.FONT_HERSHEY_SIMPLEX, 3, (0, 255, 0), 2)
+
+        out.write(frame)
+
+        # cv2.imshow("Frame", frame)
+        # if cv2.waitKey(25) & 0xFF == ord('q'):
+        #     break
+
+        # Press Q on keyboard to  exit
+        if cv2.waitKey(25) & 0xFF == ord('q'):
+          break
+
+    out.release()
     capture.release()
     cv2.destroyAllWindows()
